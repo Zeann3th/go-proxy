@@ -13,18 +13,22 @@ import (
 	"time"
 )
 
+type Upstream struct {
+	ProxyURL  *url.URL
+	Transport *http.Transport
+}
+
 type ProxyBalancer struct {
-	proxies []*url.URL
-	counter uint64
+	upstreams []*Upstream
+	counter   uint64
 }
 
 type ProxyServer struct {
-	balancer  *ProxyBalancer
-	transport *http.Transport
+	balancer *ProxyBalancer
 }
 
 func NewProxyBalancer(proxies []ProxyConfig) *ProxyBalancer {
-	parsedProxies := []*url.URL{}
+	var parsedProxies []*Upstream
 
 	for _, proxy := range proxies {
 		rawURL := proxy.URL
@@ -38,14 +42,26 @@ func NewProxyBalancer(proxies []ProxyConfig) *ProxyBalancer {
 			log.Printf("Skipping invalid proxy %v: %v", proxy, err)
 			continue
 		}
-		parsedProxies = append(parsedProxies, proxyUrl)
+		
+		transport := &http.Transport{
+			Proxy:               http.ProxyURL(proxyUrl),
+			TLSHandshakeTimeout: 10 * time.Second,
+			ForceAttemptHTTP2:   false,
+			MaxIdleConns:        10000,
+			MaxIdleConnsPerHost: 10000,
+			IdleConnTimeout:     90 * time.Second,
+		}
+		parsedProxies = append(parsedProxies, &Upstream{
+			ProxyURL:  proxyUrl,
+			Transport: transport,
+		})
 	}
-	return &ProxyBalancer{proxies: parsedProxies}
+	return &ProxyBalancer{upstreams: parsedProxies}
 }
 
-func (b *ProxyBalancer) Next() *url.URL {
+func (b *ProxyBalancer) Next() *Upstream {
 	n := atomic.AddUint64(&b.counter, 1)
-	return b.proxies[(n-1)%uint64(len(b.proxies))]
+	return b.upstreams[(n-1)%uint64(len(b.upstreams))]
 }
 
 func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -60,12 +76,23 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	outReq, _ := http.NewRequest(r.Method, r.URL.String(), r.Body)
 
 	for k, v := range r.Header {
+		if strings.EqualFold(k, "Proxy-Connection") || strings.EqualFold(k, "Connection") {
+			continue
+		}
 		for _, vv := range v {
 			outReq.Header.Add(k, vv)
 		}
 	}
 
-	client := &http.Client{Transport: p.transport}
+	upstream := p.balancer.Next()
+	log.Printf("Forwarding HTTP request to: %s", upstream.ProxyURL.Host)
+
+	client := &http.Client{
+		Transport: upstream.Transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Do(outReq)
 	if err != nil {
 		message := fmt.Sprintf("Proxy Error: %v", err.Error())
@@ -84,7 +111,8 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *ProxyServer) handleTunnel(w http.ResponseWriter, r *http.Request) {
-	upstreamProxy := p.balancer.Next()
+	upstream := p.balancer.Next()
+	upstreamProxy := upstream.ProxyURL
 	log.Printf("Balancing HTTPS tunnel to: %s", upstreamProxy.Host)
 
 	upstreamConn, err := net.DialTimeout("tcp", upstreamProxy.Host, 10*time.Second)
